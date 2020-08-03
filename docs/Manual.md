@@ -1225,6 +1225,48 @@ int compare_position(ecs_entity_t e1, Posiiton *p1, ecs_entity_t e2, Position *p
 When no component is provided in the `ecs_query_order_by` function, no reordering will happen as a result of setting components or running a system with `[out]` columns.
 
 ## Filters
+Filters allow an application to iterate through matching entities in a way that is similar to queries. Contrary to queries however, filters are not prematched, which means that a filter is evaluated as it is iterated over. Filters are therefore slower to evaluate than queries, but they have less overhead and are (much) cheaper to create. This makes filters less suitable for repeated-, but useful for ad-hoc searches where the application doesn't know beforehand which set of entities it will need.
+
+A filter can be used like this:
+
+```cpp
+ECS_COMPONENT(world, Position);
+
+/* Create filter */
+ecs_filter_t filter = {
+    .include = ecs_type(Position),
+    .include_kind = EcsMatchAll
+};
+
+/* Create iterator to filter */
+ecs_iter_t it = ecs_filter_iter(world, &filter);
+
+while (ecs_filter_next(&it)) {
+    /* Because a filter does not have a signature, we need to get the component
+     * array by finding it in the current table */
+    ecs_type_t table_type = ecs_iter_type(&it);
+
+    /* First Retrieve the column index for Position */
+    int32_t p_index = ecs_type_index_of(table_type, ecs_entity(Position));
+
+    /* Now use the column index to get the Position array from the table */
+    Position *p = ecs_table_column(&it, p_index);
+
+    /* Iterate as usual */
+    for (int i = 0; i < it.count; i ++) {
+        printf("{%f, %f}\n", p[i].x, p[i].y);
+    }
+}
+```
+
+A filter can provide an `include` and an `exclude` type, where the `include` type specifies the components the entities must have in order to match the filter, and the `exclude` type specifies the components the entity should not have. In addition to these two fields, the filter provides a `kind` field for both `include` and `exclude` types which can be one of these values:
+
+Option          | Description
+----------------|------------------------------------------------------------------------
+EcsMatchDefault | Default matching: ECsMatchAny for include, and EcsMatchAll for exclude
+EcsMatchAll     | The type must include/excldue all components
+EcsMatchAny     | The type must include/exclude one of the components
+EcsMatchExact   | The type must match exactly with the components of the entity
 
 ## Systems
 Systems allow the application to run logic that is matched with a set of entities every frame, periodically or as the result of some event. An example of a simple system definition is:
@@ -1289,8 +1331,156 @@ void Move(ecs_iter_t *it) {
 ```
 
 ## Triggers
+Triggers are callbacks that are executed when a component is added or removed from an entity. Triggers are similar to systems, but unlike systems they can only match a single component. This is an example of a trigger that is executed when the Position component is added:
+
+```c
+ECS_TRIGGER(world, AddPosition, EcsOnAdd, Position);
+```
+
+The implementation of the trigger looks similar to a system:
+
+```c
+void AddPosition(ecs_iter_t *it) {
+    Position *p = ecs_column(it, Position, 1);
+
+    for (int i = 0; i < it->count; i ++) {
+        p[i].x = 10;
+        p[i].y = 20;
+        printf("Position added\n");
+    }
+}
+```
 
 ## Modules
+Modules allow an application to split up systems and components into separate decoupled units. The purpose of modules is to make it easier to organize systems and components for large projects. Additionally, modules also make it easier to split off functionality into separate compilation units.
+
+A module consists out of a few parts:
+
+- A module type (struct) that stores handles to the contents in the modules
+- A macro to declare module contents as local variables in the scope where it is imported
+- An import function that loads the module contents for a world
+
+The module type and macro are typically located in the a separate module header file, and look like this for a module named "Vehicles":
+
+```c
+typedef struct Car {
+    float speed;
+} Car;
+
+typedef struct Bus {
+    float speed;
+} Bus;
+
+typedef struct MotorCycle {
+    float speed;
+} MotorCycle;
+
+typedef struct Vehicles {
+    /* Components are declared with ECS_DECLARE_COMPONENT */
+    ECS_DECLARE_COMPONENT(Car);
+    ECS_DECLARE_COMPONENT(Bus);
+    ECS_DECLARE_COMPONENT(MotorCycle);
+
+    /* Tags are declared with ECS_DECLARE_ENTITY */
+    ECS_DECLARE_ENTITY(Moving);
+
+    /* Systems are also declared with ECS_DECLARE_ENTITY */
+    ECS_DECLARE_ENTITY(Move);
+};
+
+/* Forward declaration to the import function */
+void VehiclesImport(ecs_world_t *world);
+
+/* The ImportHandles macro mimics the module struct */
+#define VehiclesImportHandles(handles)\
+    ECS_IMPORT_COMPONENT(handles, Car);\
+    ECS_IMPORT_COMPONENT(handles, Bus);\
+    ECS_IMPORT_COMPONENT(handles, MotorCycle);\
+    ECS_IMPORT_ENTITY(handles, Moving);\
+    ECS_IMPORT_ENTITY(handles, Move);
+```
+
+The import function for this module would look like this:
+
+```c
+void VehiclesImport(ecs_world_t *world) {
+    /* Define the module */
+    ECS_MODULE(world, Vehicles);
+
+    /* Declare components, tags and systems as usual */
+    ECS_COMPONENT(world, Car);
+    ECS_COMPONENT(world, Bus);
+    ECS_COMPONENT(world, MotorCycle);
+    ECS_TAG(world, Moving);
+    ECS_SYSTEM(world, Move, EcsOnUpdate, Car, Moving);
+
+    /* Export them so that they are assigned to the module struct */
+    ECS_EXPORT_COMPONENT(world, Car);
+    ECS_EXPORT_COMPONENT(world, Bus);
+    ECS_EXPORT_COMPONENT(world, Motorcycle);
+    ECS_EXPORT_ENTITY(world, Moving);
+    ECS_EXPORT_ENTITY(world, Move);
+}
+```
+
+After the module has been defined, it can be imported in an application like this:
+
+```c
+ecs_world_t *world = ecs_init();
+
+/* Import module, which invokes the module import function */
+ECS_IMPORT(world, Vehicles);
+
+/* The module contents can now be used */
+ecs_entity_t e = ecs_new(world, Car);
+```
+
+Module contents are namespaced, which means that the identifiers of the contenst of the module (components, tags, systems) are stored in the scope of the module. For the above example module, everything would be stored in the `vehicles` scope. To resolve the `Car` component by name, an application would have to do:
+
+```c
+ecs_entity_t car_entity = ecs_lookup_fullpath(world, "vehicles.Car");
+```
+
+Note that even though the module name is specified with uppercase, the name is stored with lowercase. This is because the naming convention for modules in C is PascalCase, whereas the stored identifiers use snake_case. If a module name contains several uppercase letters, this will be translated to a nested module. For example, the C module name `MySimpleModule` will be translated to `my.simple.module`.
+
+### Modules in C++
+A module in C++ is defined as a class where the module contents are defined in the constructor. The above Vehicles module would look like this in C++:
+
+```cpp
+/* In C++ it is more convenient to define tags as empty structs */
+struct Moving { };
+
+/* Module implementation */
+class vehicles {
+public:
+    vehicles(flecs::world& world) {
+        flecs::module<Vehicles>(world, "vehicles");
+
+        m_car = flecs::component<Car>(world, "Car");
+        m_bus = flecs::component<Bus>(world, "Bus");
+        m_motor_cycle = flecs::component<MotorCycle>(world, "MotorCycle");
+
+        m_moving = flecs::component<Moving>(world, "Moving");
+        m_move = flecs::system<Car, Moving>(world, "Move")
+            .each([](flecs::entity e, Car &car, Moving&) {
+                /* System implementation */
+            });
+    }
+
+    flecs::entity m_car;
+    flecs::entity m_bus;
+    flecs::entity m_motor_cycle;
+    flecs::entity m_moving;
+    flecs::entity m_move;
+}
+```
+
+An application can import the module in C++ like this:
+
+```cpp
+flecs::world world;
+flecs::import<vehicles>(world);
+```
 
 ## Hierarchies
 
